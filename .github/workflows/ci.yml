@@ -38,3 +38,5 @@ jobs:
         run: python tests/contract/run.py -- dotnet run --project tests/Consumer
       - name: Build package
         run: dotnet pack OriginChainDB -c Release
+      - name: Compile catalog example
+        run: dotnet build examples/Catalog -c Release
