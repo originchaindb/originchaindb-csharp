@@ -32,7 +32,7 @@ public sealed class SchemasService
     public Task<JsonElement> RegisterAsync(string toml, CancellationToken cancellationToken = default) => client.RequestAsync(HttpMethod.Post, "schemas", text: toml, cancellationToken: cancellationToken);
 }
 
-public sealed class RowsService
+public sealed partial class RowsService
 {
     private readonly Client client;
     internal RowsService(Client client) => this.client = client;
