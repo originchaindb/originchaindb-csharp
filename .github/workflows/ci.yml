@@ -32,11 +32,24 @@ jobs:
       - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
         with:
           dotnet-version: "8.0.x"
+      - name: Check out the shared API v1 contract
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: originchaindb/.github
+          ref: a47804a80fc5b31022d241dc814d905f6f78e723
+          path: .contract-reference
+          persist-credentials: false
+      - name: Verify cross-language contract
+        run: python scripts/check_contract.py
       - name: Build
         run: dotnet build OriginChainDB -c Release
       - name: HTTP contract
         run: python tests/contract/run.py -- dotnet run --project tests/Consumer
+      - name: Resilience contract
+        run: python tests/contract/resilience.py -- dotnet run --project tests/Resilience
       - name: Build package
         run: dotnet pack OriginChainDB -c Release
       - name: Compile catalog example
         run: dotnet build examples/Catalog -c Release
+      - name: Check application integration example
+        run: dotnet build examples/Integration -c Release

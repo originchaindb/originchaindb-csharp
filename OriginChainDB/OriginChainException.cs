@@ -30,6 +30,20 @@ public sealed class SqlResult
     public IReadOnlyList<SqlResult> Results { get; }
     public bool StoppedOnError { get; }
     public JsonElement Raw { get; }
+
+    /// <summary>Map rows into application models using System.Text.Json. Supply options for
+    /// custom converters or property naming. Raw rows are unchanged. No partial list is returned.</summary>
+    public IReadOnlyList<T> RowsAs<T>(JsonSerializerOptions? options = null)
+    {
+        var mapped = new T[Rows.Count];
+        for (var i = 0; i < Rows.Count; i++)
+        {
+            try { mapped[i] = Rows[i].Deserialize<T>(options) ?? throw new JsonException("Row mapped to null"); }
+            catch (Exception error) when (error is JsonException or NotSupportedException)
+            { throw new RowDecodeException(i, error); }
+        }
+        return System.Array.AsReadOnly(mapped);
+    }
     internal bool Failed => StoppedOnError || Kind == "error" || Raw.TryGetProperty("error", out _) || Results.Any(r => r.Failed);
 
     internal SqlResult(JsonElement value, bool child = false)
@@ -67,4 +81,11 @@ public sealed class SqlResult
         if (count.ValueKind != JsonValueKind.Number || !count.TryGetInt64(out var n) || n < 0) throw new OriginChainException("protocol");
         return n;
     }
+}
+
+/// <summary>Conversion failure. Message omits row data; InnerException exposes the native decoder error.</summary>
+public sealed class RowDecodeException : Exception
+{
+    public int Row { get; }
+    internal RowDecodeException(int row, Exception inner) : base($"Cannot decode SQL row {row}", inner) { Row = row; }
 }

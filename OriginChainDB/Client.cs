@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using System.Diagnostics;
 
 namespace OriginChainDB;
 
@@ -9,7 +10,10 @@ namespace OriginChainDB;
 public sealed class Client : IDisposable
 {
     private readonly string endpoint;
-    private readonly string token;
+    private readonly string? token;
+    private readonly Func<CancellationToken, ValueTask<string>>? tokenProvider;
+    private readonly Action<RequestEvent>? observer;
+    private readonly bool ownsHttp;
     private readonly HttpClient http;
     private readonly TimeSpan timeout;
     private bool disposed;
@@ -22,16 +26,27 @@ public sealed class Client : IDisposable
 
     /// <summary>Use the opaque URL copied from Connect. Dispose the client at application shutdown.</summary>
     public Client(string url, string token, TimeSpan? timeout = null)
+        : this(new ClientOptions { Url = url, Token = token, Timeout = timeout ?? TimeSpan.FromSeconds(60) }) { }
+
+    /// <summary>Configure rotating credentials, local diagnostics and an application-owned HttpClient.</summary>
+    public Client(ClientOptions options)
     {
+        ArgumentNullException.ThrowIfNull(options);
+        var url = options.Url;
+        var token = options.Token;
         if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || string.IsNullOrEmpty(uri.Host) ||
             uri.UserInfo.Length > 0 || url.Any(c => c <= 32 || c == 127 || c is '?' or '#' or '\\') ||
             !(uri.Scheme == "https" || uri.Scheme == "http" && (uri.Host == "localhost" || IPAddress.TryParse(uri.Host.Trim('[', ']'), out var ip) && IPAddress.IsLoopback(ip))))
             throw new ArgumentException("Use the HTTPS database URL copied from Connect; HTTP is only allowed on loopback", nameof(url));
-        if (string.IsNullOrEmpty(token) || token.Any(c => c <= 32 || c >= 127)) throw new ArgumentException("Token must be nonempty printable ASCII without spaces", nameof(token));
-        this.timeout = timeout ?? TimeSpan.FromSeconds(60);
-        if (this.timeout <= TimeSpan.Zero || this.timeout.TotalMilliseconds > int.MaxValue) throw new ArgumentOutOfRangeException(nameof(timeout));
+        if (options.TokenProvider is not null && token is not null) throw new ArgumentException("Configure either Token or TokenProvider, not both", nameof(options));
+        if (options.TokenProvider is null && !ValidToken(token)) throw new ArgumentException("Token must be nonempty printable ASCII without spaces", nameof(options));
+        this.timeout = options.Timeout;
+        if (this.timeout <= TimeSpan.Zero || this.timeout.TotalMilliseconds > int.MaxValue) throw new ArgumentOutOfRangeException(nameof(options));
         endpoint = url.TrimEnd('/'); this.token = token;
-        http = new HttpClient(new SocketsHttpHandler
+        tokenProvider = options.TokenProvider;
+        observer = options.OnRequest;
+        ownsHttp = options.HttpClient is null || options.DisposeHttpClient;
+        http = options.HttpClient ?? new HttpClient(new SocketsHttpHandler
         {
             AllowAutoRedirect = false,
             PooledConnectionLifetime = TimeSpan.FromMinutes(5),
@@ -43,7 +58,9 @@ public sealed class Client : IDisposable
     }
     public static Client FromEnvironment(TimeSpan? timeout = null) => new(Environment.GetEnvironmentVariable("OC_URL") ?? "", Environment.GetEnvironmentVariable("OC_TOKEN") ?? "", timeout);
     public override string ToString() => "OriginChainDB Client";
-    public void Dispose() { disposed = true; http.Dispose(); }
+    public void Dispose() { disposed = true; if (ownsHttp) http.Dispose(); }
+
+    private static bool ValidToken(string? value) => !string.IsNullOrEmpty(value) && !value.Any(c => c <= 32 || c >= 127);
 
     internal static string Path(params string[] parts) => string.Join('/', parts.Select(part =>
         string.IsNullOrEmpty(part) || part is "." or ".." || part.Any(c => c < 32 || c == 127)
@@ -52,26 +69,60 @@ public sealed class Client : IDisposable
     internal async Task<JsonElement> RequestAsync(HttpMethod method, string path, object? body = null,
         IReadOnlyDictionary<string, string>? query = null, string? text = null, CancellationToken cancellationToken = default)
     {
+        var started = Stopwatch.GetTimestamp();
+        var observed = new Observation();
+        string? errorKind = null;
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadline.CancelAfter(timeout);
+        try { return await RequestCoreAsync(method, path, body, query, text, observed, deadline.Token).ConfigureAwait(false); }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { errorKind = "timeout"; throw new OriginChainException("timeout"); }
+        catch (OperationCanceledException) { errorKind = "canceled"; throw; }
+        catch (OriginChainException error) { errorKind = error.Kind; throw; }
+        catch { errorKind = "client"; throw; }
+        finally
+        {
+            if (observer is not null)
+            {
+                var value = new RequestEvent(method.Method, RequestEvent.OperationName(path), Stopwatch.GetElapsedTime(started), observed.Status, observed.RequestId, errorKind);
+                try { observer(value); } catch (Exception) { /* observation must not alter results */ }
+            }
+        }
+    }
+
+    private sealed class Observation { public int? Status; public string? RequestId; }
+
+    private async Task<JsonElement> RequestCoreAsync(HttpMethod method, string path, object? body,
+        IReadOnlyDictionary<string, string>? query, string? text, Observation observed, CancellationToken cancellationToken)
+    {
         ObjectDisposedException.ThrowIf(disposed, this);
+        cancellationToken.ThrowIfCancellationRequested();
+        var currentToken = token;
+        if (tokenProvider is not null)
+        {
+            try { currentToken = await tokenProvider(cancellationToken).AsTask().WaitAsync(cancellationToken).ConfigureAwait(false); }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception) { throw new OriginChainException("credential"); }
+            if (!ValidToken(currentToken)) throw new OriginChainException("credential");
+        }
         var address = endpoint + "/" + path;
         if (query is { Count: > 0 }) address += "?" + string.Join('&', query.Select(pair => Uri.EscapeDataString(pair.Key) + "=" + Uri.EscapeDataString(pair.Value)));
         using var request = new HttpRequestMessage(method, address);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", currentToken);
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
         request.Headers.UserAgent.ParseAdd("originchaindb-csharp/1.0.0-rc.1");
         request.Headers.Add("X-OC-Logical-Request-Id", Guid.NewGuid().ToString("N"));
         if (text is not null) request.Content = new StringContent(text, Encoding.UTF8, "text/plain");
         else if (body is not null) request.Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        deadline.CancelAfter(timeout);
         try
         {
-            using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, deadline.Token).ConfigureAwait(false);
-            await using var stream = await response.Content.ReadAsStreamAsync(deadline.Token).ConfigureAwait(false);
+            using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+            observed.Status = (int)response.StatusCode;
+            observed.RequestId = response.Headers.TryGetValues("X-OC-Request-Id", out var requestIds) ? requestIds.FirstOrDefault() : null;
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
             using var buffer = new MemoryStream();
             var chunk = new byte[8192];
             int length;
-            while ((length = await stream.ReadAsync(chunk, deadline.Token).ConfigureAwait(false)) > 0)
+            while ((length = await stream.ReadAsync(chunk, cancellationToken).ConfigureAwait(false)) > 0)
             {
                 if (buffer.Length + length > 33_554_432) throw new OriginChainException("protocol", response.StatusCode);
                 buffer.Write(chunk, 0, length);
@@ -93,7 +144,6 @@ public sealed class Client : IDisposable
             }
             return value;
         }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { throw new OriginChainException("timeout"); }
         catch (HttpRequestException) { throw new OriginChainException("transport"); }
         catch (IOException) { throw new OriginChainException("transport"); }
     }
