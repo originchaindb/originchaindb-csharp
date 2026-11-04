@@ -189,6 +189,26 @@ The graph namespace also supports breadth-first traversal and Cypher queries.
 Cypher parameters bind **by name**; SQL parameters bind **by position**.
 See the [API guide](docs/api.md) and source links below for exact signatures.
 
+## Bulk writes and paginated reads
+
+For larger datasets, `WriteBatchesAsync` sends bounded batches and yields an acknowledgment
+for each input range. `ScanAsync` reads rows lazily in ordered pages; `PagesAsync` also
+exposes a continuation value for resumable processing. These operations use the
+same limits and failure rules across all SDKs.
+
+```csharp
+await foreach (var batch in db.Rows.WriteBatchesAsync(schema, rows,
+    new() { BatchSize = 2 }, cancellation.Token))
+{
+    Console.WriteLine($"{batch.Offset} {batch.Count} {batch.Inserted}");
+}
+```
+
+This excerpt uses `db`, `schema` and the lazy `rows` producer from the
+[complete example](examples/BulkAndScan/Program.cs). See the [bulk and pagination guide](docs/bulk-and-pagination.md)
+for setup, reads, checkpoints, cancellation and recovery. Failed writes are never
+replayed automatically; paginated reads require a unique immutable string key.
+
 ## Understanding SQL results
 
 Rows are `IReadOnlyList<JsonElement>`; choose `GetInt64`, `GetDecimal` or `GetRawText` for the column. SQL returns a result object rather than only an array:
@@ -310,3 +330,5 @@ requirements are listed at the top. Live examples use your selected database.
 Read [Contributing](CONTRIBUTING.md) before sending a change. Report bugs through
 [GitHub issues](https://github.com/originchaindb/originchaindb-csharp/issues); report security concerns
 privately as described in [Security](SECURITY.md). See [LICENSE](LICENSE) for MIT terms.
+
+See [quality and build verification](docs/quality.md) for benchmarks, API compatibility checks, package installation checks and signed build provenance.

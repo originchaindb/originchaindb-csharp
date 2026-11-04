@@ -32,7 +32,7 @@ public sealed record RowPage(IReadOnlyList<JsonElement> Rows, string? NextCursor
 
 public sealed partial class RowsService
 {
-    /// <summary>Lazily write bounded atomic JSON batches. No automatic replay.</summary>
+    /// <summary>Lazily write bounded JSON batches. No automatic replay.</summary>
     public IAsyncEnumerable<BatchResult> WriteBatchesAsync(string schema, IEnumerable<IReadOnlyDictionary<string, object?>> rows, BatchOptions? options = null, CancellationToken cancellationToken = default)
         => WriteBatchesAsync(schema, AsAsync(rows, cancellationToken), options, cancellationToken);
 
